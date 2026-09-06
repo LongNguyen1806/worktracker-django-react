@@ -1,0 +1,160 @@
+import React, { useEffect } from 'react';
+import { X } from 'lucide-react';
+import { cn } from '../../../utils/cn';
+
+/**
+ * SideDrawer - Slided-over Panel Container Component
+ * 
+ * Props:
+ * - isOpen (boolean): controls drawer visibility
+ * - onClose (function): callback on close action
+ * - title (string | ReactNode): header title
+ * - subtitle / description (string | ReactNode): optional header description
+ * - children (ReactNode): drawer content
+ * - footer (ReactNode): sticky footer action buttons
+ * - size ('sm' | 'md' | 'lg' | 'xl' | 'full'): width size variant
+ * - position ('right' | 'left'): slide direction
+ * - showCloseButton (boolean): whether to display the X button
+ */
+export default function SideDrawer({
+  isOpen = false,
+  onClose,
+  title,
+  subtitle,
+  children,
+  footer,
+  size = 'md',
+  position = 'right',
+  showCloseButton = true,
+  theme = 'light',
+  className,
+  headerClassName,
+  bodyClassName,
+}) {
+  // Handle ESC key press to close drawer
+  useEffect(() => {
+    const handleKeyDown = (e) => {
+      if (e.key === 'Escape' && isOpen && onClose) {
+        onClose();
+      }
+    };
+    if (isOpen) {
+      document.addEventListener('keydown', handleKeyDown);
+      document.body.style.overflow = 'hidden';
+    }
+    return () => {
+      document.removeEventListener('keydown', handleKeyDown);
+      document.body.style.overflow = 'unset';
+    };
+  }, [isOpen, onClose]);
+
+  if (!isOpen) return null;
+
+  const sizeClasses = {
+    sm: 'max-w-md',        // ~448px
+    md: 'max-w-lg',        // ~512px
+    lg: 'max-w-2xl',       // ~672px
+    xl: 'max-w-4xl',       // ~896px
+    '2xl': 'max-w-5xl',    // ~1024px
+    '3xl': 'max-w-6xl',    // ~1152px
+    full: 'max-w-full',
+  };
+
+  const slideInClass = position === 'right' ? 'animate-slide-in-right' : 'animate-slide-in-left';
+  const isLight = theme === 'light';
+
+  return (
+    <div className="fixed inset-0 z-50 overflow-hidden" role="dialog" aria-modal="true">
+      {/* Backdrop backdrop-blur */}
+      <div 
+        className="fixed inset-0 bg-slate-950/40 backdrop-blur-xs transition-opacity duration-300"
+        onClick={onClose}
+        aria-hidden="true"
+      />
+
+      <div className={cn("fixed inset-y-0 flex max-w-full", position === 'right' ? 'right-0 pl-10' : 'left-0 pr-10')}>
+        <div 
+          className={cn(
+            "w-screen shadow-2xl flex flex-col focus:outline-none transition-colors",
+            isLight
+              ? "bg-white border-l border-slate-200 text-slate-800"
+              : "bg-slate-900 border-l border-slate-800 text-slate-100",
+            sizeClasses[size] || sizeClasses.md,
+            slideInClass,
+            className
+          )}
+        >
+          {/* Header */}
+          {(title || showCloseButton) && (
+            <div
+              className={cn(
+                "flex items-center justify-between px-6 py-4 border-b backdrop-blur shrink-0",
+                isLight
+                  ? "border-slate-100 bg-white/95"
+                  : "border-slate-800/80 bg-slate-900/90",
+                headerClassName
+              )}
+            >
+              <div>
+                {title && (
+                  <h2
+                    className={cn(
+                      "text-lg font-bold tracking-tight",
+                      isLight ? "text-slate-900" : "text-slate-100"
+                    )}
+                  >
+                    {title}
+                  </h2>
+                )}
+                {subtitle && (
+                  <p
+                    className={cn(
+                      "mt-0.5 text-xs",
+                      isLight ? "text-slate-500" : "text-slate-400"
+                    )}
+                  >
+                    {subtitle}
+                  </p>
+                )}
+              </div>
+              {showCloseButton && (
+                <button
+                  type="button"
+                  onClick={onClose}
+                  className={cn(
+                    "p-2 rounded-lg transition-colors duration-150 focus:outline-none focus:ring-2",
+                    isLight
+                      ? "text-slate-400 hover:text-slate-700 hover:bg-slate-100 focus:ring-slate-300"
+                      : "text-slate-400 hover:text-slate-100 hover:bg-slate-800 focus:ring-slate-700"
+                  )}
+                  aria-label="Close drawer"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              )}
+            </div>
+          )}
+
+          {/* Body Content */}
+          <div className={cn("flex-1 overflow-y-auto p-6 space-y-6 custom-scrollbar", bodyClassName)}>
+            {children}
+          </div>
+
+          {/* Footer Sticky */}
+          {footer && (
+            <div
+              className={cn(
+                "px-6 py-4 border-t backdrop-blur flex items-center justify-end gap-3 shrink-0",
+                isLight
+                  ? "border-slate-100 bg-slate-50/95"
+                  : "border-slate-800 bg-slate-900/95"
+              )}
+            >
+              {footer}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}

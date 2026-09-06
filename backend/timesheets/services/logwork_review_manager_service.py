@@ -1,0 +1,444 @@
+"""
+Module: timesheets.services.logwork_review_manager_service
+Description: Service functions for manager approval, rejection, correction, and voiding of work logs.
+"""
+
+from django.db import transaction
+from django.utils import timezone
+from rest_framework.exceptions import APIException, PermissionDenied, ValidationError
+
+from timesheets.models import LogWork
+from system.models import Notification
+from system.security.scoping_manager import scoped_logworks
+from system.services.audit_manager_service import snapshot, log_action
+from system.services.notification_manager_service import notify
+from timesheets.services.daily_total_manager_service import (
+    assert_daily_total_not_exceed_8,
+    rebuild_daily_user_timesheet,
+)
+from timesheets.services.timelock_manager_service import (
+    assert_period_open_for_job,
+)
+
+
+class LogWorkReviewError(APIException):
+    """Exception raised when a work log transition violates workflow rules."""
+    status_code = 400
+    default_detail = "LogWork review rule violation."
+    default_code = "logwork_review_error"
+
+
+def assert_logwork_in_manager_scope(user, logwork):
+    """Validate that the work log belongs to a job managed by the user."""
+    if logwork.task.job.manager_id != user.id:
+        raise PermissionDenied("LOGWORK_OUT_OF_MANAGER_SCOPE")
+
+
+def get_locked_scoped_logwork(user, logwork_id):
+    """Retrieve work log by ID with a database row lock within manager scope."""
+    return (
+        scoped_logworks(user)
+        .select_for_update(of=("self",))
+        .select_related(
+            "task",
+            "task__job",
+            "user",
+            "reviewed_by",
+            "adjusted_by",
+        )
+        .get(pk=logwork_id)
+    )
+
+
+def approve_logwork(
+    *,
+    user,
+    logwork,
+    note=None,
+    request=None,
+):
+    """Transition work log status to APPROVED, recalculate daily totals, and log audit event."""
+    with transaction.atomic():
+        locked_logwork = get_locked_scoped_logwork(
+            user=user,
+            logwork_id=logwork.id,
+        )
+
+        assert_logwork_in_manager_scope(user, locked_logwork)
+
+        assert_period_open_for_job(
+            job_id=locked_logwork.task.job_id,
+            work_date=locked_logwork.work_date,
+        )
+
+        if locked_logwork.review_status == LogWork.ReviewStatus.VOIDED:
+            raise LogWorkReviewError("VOIDED_LOGWORK_CANNOT_BE_APPROVED")
+
+        if locked_logwork.review_status == LogWork.ReviewStatus.APPROVED:
+            raise LogWorkReviewError("LOGWORK_ALREADY_APPROVED")
+
+        old_values = snapshot(
+            locked_logwork,
+            fields=[
+                "review_status",
+                "reviewed_by",
+                "reviewed_at",
+                "review_note",
+            ],
+        )
+
+        locked_logwork.review_status = LogWork.ReviewStatus.APPROVED
+        locked_logwork.reviewed_by = user
+        locked_logwork.reviewed_at = timezone.now()
+        locked_logwork.review_note = note
+        locked_logwork.save(
+            update_fields=[
+                "review_status",
+                "reviewed_by",
+                "reviewed_at",
+                "review_note",
+                "updated_at",
+            ]
+        )
+
+        rebuild_daily_user_timesheet(
+            user_id=locked_logwork.user_id,
+            work_date=locked_logwork.work_date,
+        )
+
+        log_action(
+            user=user,
+            action="APPROVE_LOG_WORK",
+            table_name="log_works",
+            record_id=locked_logwork.id,
+            old_values=old_values,
+            new_values=snapshot(
+                locked_logwork,
+                fields=[
+                    "review_status",
+                    "reviewed_by",
+                    "reviewed_at",
+                    "review_note",
+                ],
+            ),
+            request=request,
+        )
+
+        notify(
+            recipients=[locked_logwork.user],
+            event_type=Notification.EventType.LOG_WORK_APPROVED,
+            title="Log work approved",
+            content=(
+                f"Your log work on {locked_logwork.work_date} "
+                f"({locked_logwork.hours_spent}h) has been approved."
+            ),
+            related_url="/employee/timesheet",
+            channel=Notification.ChannelType.SYSTEM_ONLY,
+        )
+
+    return locked_logwork
+
+
+def reject_logwork(
+    *,
+    user,
+    logwork,
+    reason,
+    request=None,
+):
+    """Transition work log status to REJECTED with mandatory reason and notify submitter."""
+    if not reason or not str(reason).strip():
+        raise ValidationError(
+            {
+                "reason": "Reject reason is required."
+            }
+        )
+
+    clean_reason = str(reason).strip()
+
+    with transaction.atomic():
+        locked_logwork = get_locked_scoped_logwork(
+            user=user,
+            logwork_id=logwork.id,
+        )
+
+        assert_logwork_in_manager_scope(user, locked_logwork)
+
+        assert_period_open_for_job(
+            job_id=locked_logwork.task.job_id,
+            work_date=locked_logwork.work_date,
+        )
+
+        if locked_logwork.review_status == LogWork.ReviewStatus.VOIDED:
+            raise LogWorkReviewError("VOIDED_LOGWORK_CANNOT_BE_REJECTED")
+
+        if locked_logwork.review_status == LogWork.ReviewStatus.REJECTED:
+            raise LogWorkReviewError("LOGWORK_ALREADY_REJECTED")
+
+        old_values = snapshot(
+            locked_logwork,
+            fields=[
+                "review_status",
+                "reviewed_by",
+                "reviewed_at",
+                "review_note",
+            ],
+        )
+
+        locked_logwork.review_status = LogWork.ReviewStatus.REJECTED
+        locked_logwork.reviewed_by = user
+        locked_logwork.reviewed_at = timezone.now()
+        locked_logwork.review_note = clean_reason
+        locked_logwork.save(
+            update_fields=[
+                "review_status",
+                "reviewed_by",
+                "reviewed_at",
+                "review_note",
+                "updated_at",
+            ]
+        )
+
+        rebuild_daily_user_timesheet(
+            user_id=locked_logwork.user_id,
+            work_date=locked_logwork.work_date,
+        )
+
+        log_action(
+            user=user,
+            action="REJECT_LOG_WORK",
+            table_name="log_works",
+            record_id=locked_logwork.id,
+            old_values=old_values,
+            new_values=snapshot(
+                locked_logwork,
+                fields=[
+                    "review_status",
+                    "reviewed_by",
+                    "reviewed_at",
+                    "review_note",
+                ],
+            ),
+            request=request,
+        )
+
+        notify(
+            recipients=[locked_logwork.user],
+            event_type=Notification.EventType.LOG_WORK_REJECTED,
+            title="Log work rejected",
+            content=(
+                f"Your log work on {locked_logwork.work_date} "
+                f"({locked_logwork.hours_spent}h) has been rejected: {clean_reason}"
+            ),
+            related_url="/employee/timesheet",
+            channel=Notification.ChannelType.SYSTEM_ONLY,
+        )
+
+    return locked_logwork
+
+
+def correct_logwork(
+    *,
+    user,
+    logwork,
+    hours_spent=None,
+    description=None,
+    adjustment_reason=None,
+    request=None,
+):
+    """Adjust hours or description on existing work log with adjustment reason and audit logging."""
+    if not adjustment_reason or not str(adjustment_reason).strip():
+        raise ValidationError(
+            {
+                "adjustment_reason": "Adjustment reason is required."
+            }
+        )
+
+    clean_reason = str(adjustment_reason).strip()
+
+    with transaction.atomic():
+        locked_logwork = get_locked_scoped_logwork(
+            user=user,
+            logwork_id=logwork.id,
+        )
+
+        assert_logwork_in_manager_scope(user, locked_logwork)
+
+        assert_period_open_for_job(
+            job_id=locked_logwork.task.job_id,
+            work_date=locked_logwork.work_date,
+        )
+
+        if locked_logwork.review_status == LogWork.ReviewStatus.VOIDED:
+            raise LogWorkReviewError("VOIDED_LOGWORK_CANNOT_BE_CORRECTED")
+
+        old_values = snapshot(
+            locked_logwork,
+            fields=[
+                "hours_spent",
+                "description",
+                "adjusted_by",
+                "adjusted_at",
+                "adjustment_reason",
+            ],
+        )
+
+        if hours_spent is not None:
+            assert_daily_total_not_exceed_8(
+                user_id=locked_logwork.user_id,
+                work_date=locked_logwork.work_date,
+                new_hours=hours_spent,
+                exclude_logwork_id=locked_logwork.id,
+            )
+
+            locked_logwork.hours_spent = hours_spent
+
+        if description is not None:
+            locked_logwork.description = description
+
+        locked_logwork.adjusted_by = user
+        locked_logwork.adjusted_at = timezone.now()
+        locked_logwork.adjustment_reason = clean_reason
+        locked_logwork.save(
+            update_fields=[
+                "hours_spent",
+                "description",
+                "adjusted_by",
+                "adjusted_at",
+                "adjustment_reason",
+                "updated_at",
+            ]
+        )
+
+        rebuild_daily_user_timesheet(
+            user_id=locked_logwork.user_id,
+            work_date=locked_logwork.work_date,
+        )
+
+        log_action(
+            user=user,
+            action="CORRECT_LOG_WORK",
+            table_name="log_works",
+            record_id=locked_logwork.id,
+            old_values=old_values,
+            new_values=snapshot(
+                locked_logwork,
+                fields=[
+                    "hours_spent",
+                    "description",
+                    "adjusted_by",
+                    "adjusted_at",
+                    "adjustment_reason",
+                ],
+            ),
+            request=request,
+        )
+
+    return locked_logwork
+
+
+def void_logwork(
+    *,
+    user,
+    logwork,
+    reason,
+    request=None,
+):
+    """Mark work log entry as VOIDED, remove hours from daily totals, and notify submitter."""
+    if not reason or not str(reason).strip():
+        raise ValidationError(
+            {
+                "reason": "Void reason is required."
+            }
+        )
+
+    clean_reason = str(reason).strip()
+
+    with transaction.atomic():
+        locked_logwork = get_locked_scoped_logwork(
+            user=user,
+            logwork_id=logwork.id,
+        )
+
+        assert_logwork_in_manager_scope(user, locked_logwork)
+
+        assert_period_open_for_job(
+            job_id=locked_logwork.task.job_id,
+            work_date=locked_logwork.work_date,
+        )
+
+        if locked_logwork.review_status == LogWork.ReviewStatus.VOIDED:
+            raise LogWorkReviewError("LOGWORK_ALREADY_VOIDED")
+
+        old_values = snapshot(
+            locked_logwork,
+            fields=[
+                "review_status",
+                "reviewed_by",
+                "reviewed_at",
+                "review_note",
+                "adjusted_by",
+                "adjusted_at",
+                "adjustment_reason",
+            ],
+        )
+
+        locked_logwork.review_status = LogWork.ReviewStatus.VOIDED
+        locked_logwork.reviewed_by = user
+        locked_logwork.reviewed_at = timezone.now()
+        locked_logwork.review_note = clean_reason
+        locked_logwork.adjusted_by = user
+        locked_logwork.adjusted_at = timezone.now()
+        locked_logwork.adjustment_reason = clean_reason
+        locked_logwork.save(
+            update_fields=[
+                "review_status",
+                "reviewed_by",
+                "reviewed_at",
+                "review_note",
+                "adjusted_by",
+                "adjusted_at",
+                "adjustment_reason",
+                "updated_at",
+            ]
+        )
+
+        rebuild_daily_user_timesheet(
+            user_id=locked_logwork.user_id,
+            work_date=locked_logwork.work_date,
+        )
+
+        log_action(
+            user=user,
+            action="VOID_LOG_WORK",
+            table_name="log_works",
+            record_id=locked_logwork.id,
+            old_values=old_values,
+            new_values=snapshot(
+                locked_logwork,
+                fields=[
+                    "review_status",
+                    "reviewed_by",
+                    "reviewed_at",
+                    "review_note",
+                    "adjusted_by",
+                    "adjusted_at",
+                    "adjustment_reason",
+                ],
+            ),
+            request=request,
+        )
+
+        notify(
+            recipients=[locked_logwork.user],
+            event_type=Notification.EventType.LOG_WORK_VOIDED,
+            title="Log work voided",
+            content=(
+                f"Your log work on {locked_logwork.work_date} "
+                f"({locked_logwork.hours_spent}h) has been voided: {clean_reason}"
+            ),
+            related_url="/employee/timesheet",
+            channel=Notification.ChannelType.SYSTEM_ONLY,
+        )
+
+    return locked_logwork
