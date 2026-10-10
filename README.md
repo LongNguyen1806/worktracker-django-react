@@ -152,7 +152,3 @@ The backend includes a comprehensive automated test suite built with **Pytest**:
 Built as a capstone project — [Aptech Vietnam](https://aptech.edu.vn/)
 
 ---
-
-## 📄 License
-
-MIT
